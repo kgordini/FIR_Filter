@@ -1,0 +1,320 @@
+clear;
+clc;
+close all;
+
+%%%%%%%%%%%%%%%%%%%%%%%
+% low-pass FIR filter %
+%%%%%%%%%%%%%%%%%%%%%%%
+
+% Project specifications
+passband = 0.20;           % transition region starts at 0.2pi rad/sample 
+stopband = 0.23;           % transition region ends at 0.23pi rad/sample
+stopband_attenuation = 80; % stopband attenuation at least 80dB
+
+% Tap number increases till quantization achieved
+tap_number_start = 100;
+tap_number_max   = 600;
+
+% Fixed-point 
+input_bits               = 16;  % fewer bits means less power
+input_fractional_bits    = 15;
+
+coeff_bits               = 24;  % finer precision to meet 80dB specification
+coeff_fractional_bits    = 23;
+
+output_bits              = 16;  % match input bit amount
+output_fractional_bits   = 15;
+
+% Convert floating point coeff into fixed point integers (easier for
+% hardware to store)
+coeff_scale = 2^coeff_fractional_bits;
+% Amount of bits to shift
+output_scale_shift = coeff_fractional_bits;
+
+% Points used to calculate frequency response
+samples = 20000;
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Figuring out tap number that meets quantized stopband specification %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+best_found = 0;
+
+% Keeps testing filters with increase in 2 taps from 100
+% Stops when quantized filter hits 80dB stopband attenuation
+for tap_number = tap_number_start:2:tap_number_max
+
+    order = tap_number - 1;
+
+    frequency = [0 passband stopband 1];
+    amplitude = [1 1 0 0];
+    weighting = [1 200];
+
+    % Create filter coefficients
+    impulse_response_try = firpm(order, frequency, amplitude, weighting);
+
+    % Calculates non-quantized filter response
+    [freq_response, freq_axis] = freqz(impulse_response_try, 1, samples);
+    magnitude_dB_try = 20*log10(abs(freq_response) + 1e-16);
+
+    stopband_index_try = (freq_axis/pi) >= stopband;
+    % Makes positive attenuation in dB
+    stopband_atten_try = -max(magnitude_dB_try(stopband_index_try));
+
+    % Quantize coefficients with finer precision
+    quantized_coeff_try = round(impulse_response_try * coeff_scale);
+
+    % Prevents overflow in coefficient (fits inside signed 24 bit range)
+    quantized_coeff_try(quantized_coeff_try >  2^(coeff_bits-1)-1) =  2^(coeff_bits-1)-1;
+    quantized_coeff_try(quantized_coeff_try < -2^(coeff_bits-1)  ) = -2^(coeff_bits-1);
+
+    % Converts integers into decimal values
+    reconstructed_quant_coeff_try = quantized_coeff_try / coeff_scale;
+
+    % Quantized response
+    [quant_freq_resp, quant_freq_axis] = freqz(reconstructed_quant_coeff_try, 1, samples);
+    magnitude_dB_q_try = 20*log10(abs(quant_freq_resp) + 1e-16);
+
+    stopband_index_q_try = (quant_freq_axis/pi) >= stopband;
+    stopband_atten_q_try = -max(magnitude_dB_q_try(stopband_index_q_try));
+
+    fprintf('Taps = %3d | Stopband = %8.2f dB | Quant stopband = %8.2f dB\n', ...
+        tap_number, stopband_atten_try, stopband_atten_q_try);
+
+    % Save first good design that reaches 80dB
+    if stopband_atten_q_try >= stopband_attenuation
+        best_found = 1;
+
+        final_tap_number = tap_number;
+        final_order = order;
+
+        impulse_response = impulse_response_try;
+        quantized_coeff = quantized_coeff_try;
+        reconstructed_quant_coeff = reconstructed_quant_coeff_try;
+
+        final_stopband_atten_float = stopband_atten_try;
+        final_stopband_atten_quant = stopband_atten_q_try;
+
+        break;
+    end
+end
+
+if best_found == 0
+    error('%d taps was not enough to meet 80dB', tap_number_max);
+end
+
+fprintf('\n====================================================\n');
+fprintf('Final design: \n');
+fprintf('Tap number                 = %d\n', final_tap_number);
+fprintf('Filter order               = %d\n', final_order);
+fprintf('Stopband attenuation       = %.2f dB\n', final_stopband_atten_float);
+fprintf('Quant stopband attenuation = %.2f dB\n', final_stopband_atten_quant);
+fprintf('====================================================\n');
+
+%%%%%%%%%%%%%%%%%%%%%%%%
+% Final response plots %
+%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Calculate final FIR response
+[frequency_response, frequency_vector] = freqz(impulse_response, 1, samples);
+magnitude_dB = 20*log10(abs(frequency_response) + 1e-16);
+
+% Calculate non-quantized vs quantized comparison
+[freq_resp_quant, freq_axis] = freqz(reconstructed_quant_coeff, 1, samples);
+magnitude_dB_quant = 20*log10(abs(freq_resp_quant) + 1e-16);
+
+% FIR Filter Response
+figure;
+plot(frequency_vector/pi, magnitude_dB, 'LineWidth', 1.5);
+grid on;
+xlabel('\omega / \pi');
+ylabel('Magnitude (dB)');
+title(sprintf('FIR Filter Response (%d taps)', final_tap_number));
+ylim([-140 10]);
+
+% Non-Quantized vs Quantized Response
+figure;
+plot(frequency_vector/pi, magnitude_dB, 'LineWidth', 1.5); hold on;
+plot(freq_axis/pi, magnitude_dB_quant, '--', 'LineWidth', 1.5);
+grid on;
+xlabel('\omega / \pi');
+ylabel('Magnitude (dB)');
+title(sprintf('Non-Quantized vs Quantized Response (%d taps)', final_tap_number));
+legend('Non-Quantized', 'Quantized');
+ylim([-140 10]);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Compare ripple and stopband %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Showcasing how quantization changes filter performance
+passband_index = find(frequency_vector/pi <= passband);
+stopband_index = find(frequency_vector/pi >= stopband);
+
+passband_ripple_nonquant = max(magnitude_dB(passband_index)) - min(magnitude_dB(passband_index));
+passband_ripple_quant    = max(magnitude_dB_quant(passband_index)) - min(magnitude_dB_quant(passband_index));
+
+stopband_attenuation_nonquant = -max(magnitude_dB(stopband_index));
+stopband_attenuation_quant    = -max(magnitude_dB_quant(stopband_index));
+
+fprintf('\nComparison:\n');
+fprintf('Non-Quantized passband ripple:       %.4f dB\n', passband_ripple_nonquant);
+fprintf('Quantized passband ripple:           %.4f dB\n', passband_ripple_quant);
+fprintf('Non-Quantized stopband attenuation:  %.4f dB\n', stopband_attenuation_nonquant);
+fprintf('Quantized stopband attenuation:      %.4f dB\n', stopband_attenuation_quant);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Hardware specifications %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Determines what hardware sizes are needed
+product_bits = input_bits + coeff_bits;
+accumulator_bits = product_bits + ceil(log2(final_tap_number));
+shift_bits = coeff_fractional_bits;
+
+% Overflow checker
+max_input_integer = 2^(input_bits-1) - 1;
+max_coeff_integer = max(abs(quantized_coeff));
+worst_case_product = double(max_input_integer) * double(max_coeff_integer);
+worst_case_accumulator = final_tap_number * worst_case_product;
+required_acc_bits = ceil(log2(abs(worst_case_accumulator) + 1)) + 1;
+
+fprintf('\nHardware Summary:\n');
+fprintf('Input bits:                  %d bits\n', input_bits);
+fprintf('Input fractional bits:       %d\n', input_fractional_bits);
+fprintf('Coefficient bits:            %d bits\n', coeff_bits);
+fprintf('Coefficient fractional bits: %d\n', coeff_fractional_bits);
+fprintf('Output bits:                 %d bits\n', output_bits);
+fprintf('Output fractional bits:      %d\n', output_fractional_bits);
+fprintf('Estimated product width:     %d bits\n', product_bits);
+fprintf('Estimated accumulator width: %d bits\n', accumulator_bits);
+fprintf('Required acc bits estimate:  %d bits\n', required_acc_bits);
+fprintf('Right shift:                 %d bits\n', shift_bits);
+
+if accumulator_bits >= required_acc_bits
+    fprintf('Accumulator estimate looks good\n');
+else
+    fprintf('Warning: accumulator estimate is bad\n');
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Export coefficients for verilog % 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+file_ID = fopen('matlab.hex', 'w');
+for i = 1:length(quantized_coeff)
+    value = int32(quantized_coeff(i));
+
+     % Convert negative values to 24 bit two's complement
+    if value < 0
+        value = value + 2^24;
+    end
+
+    % Keep only 24 bits and print exactly 6 hex digits
+    fprintf(file_ID, '%06X\n', bitand(value, 2^24 - 1));
+end
+fclose(file_ID);
+
+fprintf('\nExported %d coefficients to matlab.hex\n', length(quantized_coeff));
+
+%%%%%%%%%%%%%%%%%%%%%%%
+% Generate test input %
+%%%%%%%%%%%%%%%%%%%%%%%
+
+test_length = 300;
+rng(1); % same test signal is generated every time
+
+% Creates 300-sample test signal
+%  Step Input
+%  Low-frequency sine
+%  High-frequency sine
+%  Zero
+%  Random Noise
+input_signal_real = [0.5 * ones(1,20), sin(2*pi*0.05*(0:79)), 0.5*sin(2*pi*0.30*(0:79)), zeros(1,20), 0.8*randn(1,101) / 3];
+input_signal_real = input_signal_real(1:test_length);
+input_signal_real(input_signal_real >  0.999969) =  0.999969;
+input_signal_real(input_signal_real < -1.000000) = -1.000000;
+
+% Converts floating point input into signed 16 bit format
+input_scale = 2^input_fractional_bits;
+input_signal = round(input_signal_real * input_scale);
+
+input_signal(input_signal >  2^(input_bits-1)-1) =  2^(input_bits-1)-1;
+input_signal(input_signal < -2^(input_bits-1)  ) = -2^(input_bits-1);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Golden output (quantized coefficients) %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Shifts delay, inserts new sample, multiply each delayed sample by its
+% coefficient, sums everything, shifts down, and make into 16 bit output
+golden_output = zeros(1, test_length);
+delay_line = zeros(1, final_tap_number);
+
+for n = 1:test_length
+    delay_line(2:end) = delay_line(1:end-1);
+    delay_line(1) = input_signal(n);
+
+    accumulator_value = sum(double(delay_line) .* double(quantized_coeff(:)'));
+
+    % Shift by coeff fractional bits to return to 16 bits
+    output_value = round(accumulator_value / (2^coeff_fractional_bits));
+
+    if output_value > 2^(output_bits-1)-1
+        output_value = 2^(output_bits-1)-1;
+    elseif output_value < -2^(output_bits-1)
+        output_value = -2^(output_bits-1);
+    end
+
+    golden_output(n) = output_value;
+end
+
+fprintf('\nGenerated %d input samples and golden outputs\n', test_length);
+
+%%%%%%%%%%%%%%%%%%%%%
+% Export test input %
+%%%%%%%%%%%%%%%%%%%%%
+
+file_input = fopen('input.txt', 'w');
+for i = 1:length(input_signal)
+    fprintf(file_input, '%d\n', input_signal(i));
+end
+fclose(file_input);
+fprintf('Exported test input to input.txt\n');
+
+%%%%%%%%%%%%%%%%%%%%%%%%
+% Export golden output %
+%%%%%%%%%%%%%%%%%%%%%%%%
+
+file_output = fopen('golden.txt', 'w');
+for i = 1:length(golden_output)
+    fprintf(file_output, '%d\n', golden_output(i));
+end
+fclose(file_output);
+fprintf('Exported golden output to golden.txt\n');
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Plot input and golden output %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+figure;
+plot(input_signal,  'LineWidth', 1.2); hold on;
+plot(golden_output, 'LineWidth', 1.2);
+grid on;
+xlabel('Sample Index');
+ylabel('Amplitude');
+title('Test Input and Golden Output');
+legend('Input', 'Golden Output');
+
+%%%%%%%%%%%%%%%%%%
+% Save variables %
+%%%%%%%%%%%%%%%%%%
+
+save('FIR_coeffs.mat', 'impulse_response','quantized_coeff', ...
+    'reconstructed_quant_coeff', 'input_signal', 'golden_output', ...
+    'input_bits', 'input_fractional_bits', 'coeff_bits', 'coeff_fractional_bits', ...
+    'output_bits', 'output_fractional_bits', 'product_bits', 'accumulator_bits', ...
+    'required_acc_bits', 'shift_bits', 'final_tap_number');
+
+fprintf('Saved MATLAB variables to FIR_coeffs.mat\n');
